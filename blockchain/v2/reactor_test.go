@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	dbm "github.com/tendermint/tm-db"
 
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/behaviour"
-	bc "github.com/tendermint/tendermint/blockchain"
 	cfg "github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
@@ -32,11 +32,11 @@ import (
 
 type mockPeer struct {
 	service.Service
-	id p2p.ID
+	id p2p.NodeID
 }
 
 func (mp mockPeer) FlushStop()           {}
-func (mp mockPeer) ID() p2p.ID           { return mp.id }
+func (mp mockPeer) ID() p2p.NodeID       { return mp.id }
 func (mp mockPeer) RemoteIP() net.IP     { return net.IP{} }
 func (mp mockPeer) RemoteAddr() net.Addr { return &net.TCPAddr{IP: mp.RemoteIP(), Port: 8800} }
 
@@ -45,9 +45,9 @@ func (mp mockPeer) IsPersistent() bool { return true }
 func (mp mockPeer) CloseConn() error   { return nil }
 
 func (mp mockPeer) NodeInfo() p2p.NodeInfo {
-	return p2p.DefaultNodeInfo{
-		DefaultNodeID: "",
-		ListenAddr:    "",
+	return p2p.NodeInfo{
+		NodeID:     "",
+		ListenAddr: "",
 	}
 }
 func (mp mockPeer) Status() conn.ConnectionStatus { return conn.ConnectionStatus{} }
@@ -93,34 +93,37 @@ type mockSwitchIo struct {
 	numStatusResponse   int
 	numBlockResponse    int
 	numNoBlockResponse  int
+	numStatusRequest    int
 }
 
-func (sio *mockSwitchIo) sendBlockRequest(peerID p2p.ID, height int64) error {
+var _ iIO = (*mockSwitchIo)(nil)
+
+func (sio *mockSwitchIo) sendBlockRequest(_ p2p.Peer, _ int64) error {
 	return nil
 }
 
-func (sio *mockSwitchIo) sendStatusResponse(base, height int64, peerID p2p.ID) error {
+func (sio *mockSwitchIo) sendStatusResponse(_, _ int64, _ p2p.Peer) error {
 	sio.mtx.Lock()
 	defer sio.mtx.Unlock()
 	sio.numStatusResponse++
 	return nil
 }
 
-func (sio *mockSwitchIo) sendBlockToPeer(block *types.Block, peerID p2p.ID) error {
+func (sio *mockSwitchIo) sendBlockToPeer(_ *types.Block, _ p2p.Peer) error {
 	sio.mtx.Lock()
 	defer sio.mtx.Unlock()
 	sio.numBlockResponse++
 	return nil
 }
 
-func (sio *mockSwitchIo) sendBlockNotFound(height int64, peerID p2p.ID) error {
+func (sio *mockSwitchIo) sendBlockNotFound(_ int64, _ p2p.Peer) error {
 	sio.mtx.Lock()
 	defer sio.mtx.Unlock()
 	sio.numNoBlockResponse++
 	return nil
 }
 
-func (sio *mockSwitchIo) trySwitchToConsensus(state sm.State, skipWAL bool) bool {
+func (sio *mockSwitchIo) trySwitchToConsensus(_ sm.State, _ bool) bool {
 	sio.mtx.Lock()
 	defer sio.mtx.Unlock()
 	sio.switchedToConsensus = true
@@ -128,6 +131,13 @@ func (sio *mockSwitchIo) trySwitchToConsensus(state sm.State, skipWAL bool) bool
 }
 
 func (sio *mockSwitchIo) broadcastStatusRequest() error {
+	return nil
+}
+
+func (sio *mockSwitchIo) sendStatusRequest(_ p2p.Peer) error {
+	sio.mtx.Lock()
+	defer sio.mtx.Unlock()
+	sio.numStatusRequest++
 	return nil
 }
 
@@ -399,23 +409,37 @@ func TestReactorHelperMode(t *testing.T) {
 				switch ev := step.event.(type) {
 				case bcproto.StatusRequest:
 					old := mockSwitch.numStatusResponse
-					msg, err := bc.EncodeMsg(&ev)
-					assert.NoError(t, err)
-					reactor.Receive(channelID, mockPeer{id: p2p.ID(step.peer)}, msg)
+
+					msgProto := new(bcproto.Message)
+					require.NoError(t, msgProto.Wrap(&ev))
+
+					msgBz, err := proto.Marshal(msgProto)
+					require.NoError(t, err)
+
+					reactor.Receive(channelID, mockPeer{id: p2p.NodeID(step.peer)}, msgBz)
 					assert.Equal(t, old+1, mockSwitch.numStatusResponse)
 				case bcproto.BlockRequest:
 					if ev.Height > params.startHeight {
 						old := mockSwitch.numNoBlockResponse
-						msg, err := bc.EncodeMsg(&ev)
-						assert.NoError(t, err)
-						reactor.Receive(channelID, mockPeer{id: p2p.ID(step.peer)}, msg)
+
+						msgProto := new(bcproto.Message)
+						require.NoError(t, msgProto.Wrap(&ev))
+
+						msgBz, err := proto.Marshal(msgProto)
+						require.NoError(t, err)
+
+						reactor.Receive(channelID, mockPeer{id: p2p.NodeID(step.peer)}, msgBz)
 						assert.Equal(t, old+1, mockSwitch.numNoBlockResponse)
 					} else {
 						old := mockSwitch.numBlockResponse
-						msg, err := bc.EncodeMsg(&ev)
-						assert.NoError(t, err)
-						assert.NoError(t, err)
-						reactor.Receive(channelID, mockPeer{id: p2p.ID(step.peer)}, msg)
+
+						msgProto := new(bcproto.Message)
+						require.NoError(t, msgProto.Wrap(&ev))
+
+						msgBz, err := proto.Marshal(msgProto)
+						require.NoError(t, err)
+
+						reactor.Receive(channelID, mockPeer{id: p2p.NodeID(step.peer)}, msgBz)
 						assert.Equal(t, old+1, mockSwitch.numBlockResponse)
 					}
 				}

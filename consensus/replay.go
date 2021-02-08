@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -241,7 +242,7 @@ func (h *Handshaker) NBlocks() int {
 func (h *Handshaker) Handshake(proxyApp proxy.AppConns) error {
 
 	// Handshake is done via ABCI Info on the query conn.
-	res, err := proxyApp.Query().InfoSync(proxy.RequestInfo)
+	res, err := proxyApp.Query().InfoSync(context.Background(), proxy.RequestInfo)
 	if err != nil {
 		return fmt.Errorf("error calling Info: %v", err)
 	}
@@ -254,7 +255,7 @@ func (h *Handshaker) Handshake(proxyApp proxy.AppConns) error {
 
 	h.logger.Info("ABCI Handshake App Info",
 		"height", blockHeight,
-		"hash", fmt.Sprintf("%X", appHash),
+		"hash", appHash,
 		"software-version", res.Version,
 		"protocol-version", res.AppVersion,
 	)
@@ -271,7 +272,7 @@ func (h *Handshaker) Handshake(proxyApp proxy.AppConns) error {
 	}
 
 	h.logger.Info("Completed ABCI Handshake - Tendermint and App are synced",
-		"appHeight", blockHeight, "appHash", fmt.Sprintf("%X", appHash))
+		"appHeight", blockHeight, "appHash", appHash)
 
 	// TODO: (on restart) replay mempool
 
@@ -307,16 +308,16 @@ func (h *Handshaker) ReplayBlocks(
 		}
 		validatorSet := types.NewValidatorSet(validators)
 		nextVals := types.TM2PB.ValidatorUpdates(validatorSet)
-		csParams := types.TM2PB.ConsensusParams(h.genDoc.ConsensusParams)
+		pbParams := h.genDoc.ConsensusParams.ToProto()
 		req := abci.RequestInitChain{
 			Time:            h.genDoc.GenesisTime,
 			ChainId:         h.genDoc.ChainID,
 			InitialHeight:   h.genDoc.InitialHeight,
-			ConsensusParams: csParams,
+			ConsensusParams: &pbParams,
 			Validators:      nextVals,
 			AppStateBytes:   h.genDoc.AppState,
 		}
-		res, err := proxyApp.Consensus().InitChainSync(req)
+		res, err := proxyApp.Consensus().InitChainSync(context.Background(), req)
 		if err != nil {
 			return nil, err
 		}
@@ -344,7 +345,7 @@ func (h *Handshaker) ReplayBlocks(
 			}
 
 			if res.ConsensusParams != nil {
-				state.ConsensusParams = types.UpdateConsensusParams(state.ConsensusParams, res.ConsensusParams)
+				state.ConsensusParams = state.ConsensusParams.UpdateConsensusParams(res.ConsensusParams)
 				state.Version.Consensus.App = state.ConsensusParams.Version.AppVersion
 			}
 			// We update the last results hash with the empty hash, to conform with RFC-6962.

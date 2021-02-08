@@ -4,6 +4,8 @@ order: 4
 
 # Running in production
 
+If you are building Tendermint from source for use in production, make sure to check out an appropriate Git tag instead of a branch.
+
 ## Database
 
 By default, Tendermint uses the `syndtr/goleveldb` package for its in-process
@@ -34,14 +36,14 @@ Applications can use [state sync](state-sync.md) to help nodes bootstrap quickly
 
 ## Logging
 
-Default logging level (`log_level = "main:info,state:info,statesync:info,*:error"`) should suffice for
+Default logging level (`log-level = "main:info,state:info,statesync:info,*:error"`) should suffice for
 normal operation mode. Read [this
 post](https://blog.cosmos.network/one-of-the-exciting-new-features-in-0-10-0-release-is-smart-log-level-flag-e2506b4ab756)
-for details on how to configure `log_level` config variable. Some of the
-modules can be found [here](./how-to-read-logs.md#list-of-modules). If
+for details on how to configure `log-level` config variable. Some of the
+modules can be found [here](../nodes/logging#list-of-modules). If
 you're trying to debug Tendermint or asked to provide logs with debug
 logging level, you can do so by running Tendermint with
-`--log_level="*:debug"`.
+`--log-level="*:debug"`.
 
 ## Write Ahead Logs (WAL)
 
@@ -71,7 +73,7 @@ polling for them, or using `/broadcast_tx_commit`. In the worst case, txs can be
 resent from the mempool WAL manually.
 
 For the above reasons, the `mempool.wal` is disabled by default. To enable, set
-`mempool.wal_dir` to where you want the WAL to be located (e.g.
+`mempool.wal-dir` to where you want the WAL to be located (e.g.
 `data/mempool.wal`).
 
 ## DOS Exposure and Mitigation
@@ -107,7 +109,7 @@ to achieve the same things.
 ## Debugging Tendermint
 
 If you ever have to debug Tendermint, the first thing you should probably do is
-check out the logs. See [How to read logs](./how-to-read-logs.md), where we
+check out the logs. See [Logging](../nodes/logging.md), where we
 explain what certain log statements mean.
 
 If, after skimming through the logs, things are not clear still, the next thing
@@ -220,8 +222,8 @@ Recovering from data corruption can be hard and time-consuming. Here are two app
     ./scripts/wal2json/wal2json "$TMHOME/data/cs.wal/wal" > /tmp/corrupted_wal
     ```
 
-3)  Search for a "CORRUPTED MESSAGE" line.
-4)  By looking at the previous message and the message after the corrupted one
+3) Search for a "CORRUPTED MESSAGE" line.
+4) By looking at the previous message and the message after the corrupted one
    and looking at the logs, try to rebuild the message. If the consequent
    messages are marked as corrupted too (this may happen if length header
    got corrupted or some writes did not make it to the WAL ~ truncation),
@@ -232,7 +234,7 @@ Recovering from data corruption can be hard and time-consuming. Here are two app
     $EDITOR /tmp/corrupted_wal
     ```
 
-5)  After editing, convert this file back into binary form by running:
+5) After editing, convert this file back into binary form by running:
 
     ```sh
     ./scripts/json2wal/json2wal /tmp/corrupted_wal  $TMHOME/data/cs.wal/wal
@@ -294,10 +296,10 @@ Cosmos network.
 
 ## Configuration parameters
 
-- `p2p.flush_throttle_timeout`
-- `p2p.max_packet_msg_payload_size`
-- `p2p.send_rate`
-- `p2p.recv_rate`
+- `p2p.flush-throttle-timeout`
+- `p2p.max-packet-msg-payload-size`
+- `p2p.send-rate`
+- `p2p.recv-rate`
 
 If you are going to use Tendermint in a private domain and you have a
 private high-speed network among your peers, it makes sense to lower
@@ -305,11 +307,10 @@ flush throttle timeout and increase other params.
 
 ```toml
 [p2p]
-
-send_rate=20000000 # 2MB/s
-recv_rate=20000000 # 2MB/s
-flush_throttle_timeout=10
-max_packet_msg_payload_size=10240 # 10KB
+send-rate=20000000 # 2MB/s
+recv-rate=20000000 # 2MB/s
+flush-throttle-timeout=10
+max-packet-msg-payload-size=10240 # 10KB
 ```
 
 - `mempool.recheck`
@@ -326,26 +327,26 @@ Setting this to false will stop the mempool from relaying transactions
 to other peers until they are included in a block. It means only the
 peer you send the tx to will see it until it is included in a block.
 
-- `consensus.skip_timeout_commit`
+- `consensus.skip-timeout-commit`
 
-We want `skip_timeout_commit=false` when there is economics on the line
+We want `skip-timeout-commit=false` when there is economics on the line
 because proposers should wait to hear for more votes. But if you don't
 care about that and want the fastest consensus, you can skip it. It will
 be kept false by default for public deployments (e.g. [Cosmos
 Hub](https://cosmos.network/intro/hub)) while for enterprise
 applications, setting it to true is not a problem.
 
-- `consensus.peer_gossip_sleep_duration`
+- `consensus.peer-gossip-sleep-duration`
 
 You can try to reduce the time your node sleeps before checking if
 theres something to send its peers.
 
-- `consensus.timeout_commit`
+- `consensus.timeout-commit`
 
-You can also try lowering `timeout_commit` (time we sleep before
+You can also try lowering `timeout-commit` (time we sleep before
 proposing the next block).
 
-- `p2p.addr_book_strict`
+- `p2p.addr-book-strict`
 
 By default, Tendermint checks whenever a peer's address is routable before
 saving it to the address book. The address is considered as routable if the IP
@@ -353,10 +354,10 @@ is [valid and within allowed
 ranges](https://github.com/tendermint/tendermint/blob/27bd1deabe4ba6a2d9b463b8f3e3f1e31b993e61/p2p/netaddress.go#L209).
 
 This may not be the case for private or local networks, where your IP range is usually
-strictly limited and private. If that case, you need to set `addr_book_strict`
+strictly limited and private. If that case, you need to set `addr-book-strict`
 to `false` (turn it off).
 
-- `rpc.max_open_connections`
+- `rpc.max-open-connections`
 
 By default, the number of simultaneous connections is limited because most OS
 give you limited number of file descriptors.
@@ -390,4 +391,4 @@ echo $((N/8)) > /sys/module/nf_conntrack/parameters/hashsize
 ```
 
 The similar option exists for limiting the number of gRPC connections -
-`rpc.grpc_max_open_connections`.
+`rpc.grpc-max-open-connections`.

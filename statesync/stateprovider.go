@@ -15,7 +15,6 @@ import (
 	lighthttp "github.com/tendermint/tendermint/light/provider/http"
 	lightrpc "github.com/tendermint/tendermint/light/rpc"
 	lightdb "github.com/tendermint/tendermint/light/store/db"
-	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
 	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
@@ -38,7 +37,7 @@ type StateProvider interface {
 type lightClientStateProvider struct {
 	tmsync.Mutex  // light.Client is not concurrency-safe
 	lc            *light.Client
-	version       tmstate.Version
+	version       sm.Version
 	initialHeight int64
 	providers     map[lightprovider.Provider]string
 }
@@ -47,7 +46,7 @@ type lightClientStateProvider struct {
 func NewLightClientStateProvider(
 	ctx context.Context,
 	chainID string,
-	version tmstate.Version,
+	version sm.Version,
 	initialHeight int64,
 	servers []string,
 	trustOptions light.TrustOptions,
@@ -72,7 +71,7 @@ func NewLightClientStateProvider(
 	}
 
 	lc, err := light.NewClient(ctx, chainID, trustOptions, providers[0], providers[1:],
-		lightdb.New(dbm.NewMemDB(), ""), light.Logger(logger), light.MaxRetryAttempts(5))
+		lightdb.New(dbm.NewMemDB()), light.Logger(logger))
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +149,7 @@ func (s *lightClientStateProvider) State(ctx context.Context, height uint64) (sm
 	if err != nil {
 		return sm.State{}, err
 	}
-	curLightBlock, err := s.lc.VerifyLightBlockAtHeight(ctx, int64(height+1), time.Now())
+	currentLightBlock, err := s.lc.VerifyLightBlockAtHeight(ctx, int64(height+1), time.Now())
 	if err != nil {
 		return sm.State{}, err
 	}
@@ -162,10 +161,10 @@ func (s *lightClientStateProvider) State(ctx context.Context, height uint64) (sm
 	state.LastBlockHeight = lastLightBlock.Height
 	state.LastBlockTime = lastLightBlock.Time
 	state.LastBlockID = lastLightBlock.Commit.BlockID
-	state.AppHash = curLightBlock.AppHash
-	state.LastResultsHash = curLightBlock.LastResultsHash
+	state.AppHash = currentLightBlock.AppHash
+	state.LastResultsHash = currentLightBlock.LastResultsHash
 	state.LastValidators = lastLightBlock.ValidatorSet
-	state.Validators = curLightBlock.ValidatorSet
+	state.Validators = currentLightBlock.ValidatorSet
 	state.NextValidators = nextLightBlock.ValidatorSet
 	state.LastHeightValidatorsChanged = nextLightBlock.Height
 
@@ -179,12 +178,13 @@ func (s *lightClientStateProvider) State(ctx context.Context, height uint64) (sm
 		return sm.State{}, fmt.Errorf("unable to create RPC client: %w", err)
 	}
 	rpcclient := lightrpc.NewClient(primaryRPC, s.lc)
-	result, err := rpcclient.ConsensusParams(ctx, &nextLightBlock.Height)
+	result, err := rpcclient.ConsensusParams(ctx, &currentLightBlock.Height)
 	if err != nil {
 		return sm.State{}, fmt.Errorf("unable to fetch consensus parameters for height %v: %w",
 			nextLightBlock.Height, err)
 	}
 	state.ConsensusParams = result.ConsensusParams
+	state.LastHeightConsensusParamsChanged = currentLightBlock.Height
 
 	return state, nil
 }

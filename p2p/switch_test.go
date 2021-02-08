@@ -2,9 +2,9 @@ package p2p
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -28,6 +28,7 @@ import (
 
 var (
 	cfg *config.P2PConfig
+	ctx = context.Background()
 )
 
 func init() {
@@ -37,7 +38,7 @@ func init() {
 }
 
 type PeerMessage struct {
-	PeerID  ID
+	PeerID  NodeID
 	Bytes   []byte
 	Counter int
 }
@@ -240,15 +241,20 @@ func TestSwitchPeerFilter(t *testing.T) {
 	rp.Start()
 	t.Cleanup(rp.Stop)
 
-	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
-		chDescs:      sw.chDescs,
-		onPeerError:  sw.StopPeerForError,
-		isPersistent: sw.IsPeerPersistent,
-		reactorsByCh: sw.reactorsByCh,
-	})
+	c, err := sw.transport.Dial(ctx, rp.Addr().Endpoint())
 	if err != nil {
 		t.Fatal(err)
 	}
+	peerInfo, _, err := c.Handshake(ctx, sw.nodeInfo, sw.nodeKey.PrivKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPeer(
+		peerInfo,
+		newPeerConn(true, false, c),
+		sw.reactorsByCh,
+		sw.StopPeerForError,
+	)
 
 	err = sw.addPeer(p)
 	if err, ok := err.(ErrRejected); ok {
@@ -291,15 +297,20 @@ func TestSwitchPeerFilterTimeout(t *testing.T) {
 	rp.Start()
 	defer rp.Stop()
 
-	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
-		chDescs:      sw.chDescs,
-		onPeerError:  sw.StopPeerForError,
-		isPersistent: sw.IsPeerPersistent,
-		reactorsByCh: sw.reactorsByCh,
-	})
+	c, err := sw.transport.Dial(ctx, rp.Addr().Endpoint())
 	if err != nil {
 		t.Fatal(err)
 	}
+	peerInfo, _, err := c.Handshake(ctx, sw.nodeInfo, sw.nodeKey.PrivKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPeer(
+		peerInfo,
+		newPeerConn(true, false, c),
+		sw.reactorsByCh,
+		sw.StopPeerForError,
+	)
 
 	err = sw.addPeer(p)
 	if _, ok := err.(ErrFilterTimeout); !ok {
@@ -322,15 +333,20 @@ func TestSwitchPeerFilterDuplicate(t *testing.T) {
 	rp.Start()
 	defer rp.Stop()
 
-	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
-		chDescs:      sw.chDescs,
-		onPeerError:  sw.StopPeerForError,
-		isPersistent: sw.IsPeerPersistent,
-		reactorsByCh: sw.reactorsByCh,
-	})
+	c, err := sw.transport.Dial(ctx, rp.Addr().Endpoint())
 	if err != nil {
 		t.Fatal(err)
 	}
+	peerInfo, _, err := c.Handshake(ctx, sw.nodeInfo, sw.nodeKey.PrivKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPeer(
+		peerInfo,
+		newPeerConn(true, false, c),
+		sw.reactorsByCh,
+		sw.StopPeerForError,
+	)
 
 	if err := sw.addPeer(p); err != nil {
 		t.Fatal(err)
@@ -372,13 +388,20 @@ func TestSwitchStopsNonPersistentPeerOnError(t *testing.T) {
 	rp.Start()
 	defer rp.Stop()
 
-	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
-		chDescs:      sw.chDescs,
-		onPeerError:  sw.StopPeerForError,
-		isPersistent: sw.IsPeerPersistent,
-		reactorsByCh: sw.reactorsByCh,
-	})
-	require.Nil(err)
+	c, err := sw.transport.Dial(ctx, rp.Addr().Endpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerInfo, _, err := c.Handshake(ctx, sw.nodeInfo, sw.nodeKey.PrivKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPeer(
+		peerInfo,
+		newPeerConn(true, false, c),
+		sw.reactorsByCh,
+		sw.StopPeerForError,
+	)
 
 	err = sw.addPeer(p)
 	require.Nil(err)
@@ -386,7 +409,7 @@ func TestSwitchStopsNonPersistentPeerOnError(t *testing.T) {
 	require.NotNil(sw.Peers().Get(rp.ID()))
 
 	// simulate failure by closing connection
-	err = p.(*peer).CloseConn()
+	err = p.CloseConn()
 	require.NoError(err)
 
 	assertNoPeersAfterTimeout(t, sw, 100*time.Millisecond)
@@ -603,9 +626,8 @@ func TestSwitchAcceptRoutine(t *testing.T) {
 	err = sw.Start()
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		if err := sw.Stop(); err != nil {
-			t.Error(err)
-		}
+		err := sw.Stop()
+		require.NoError(t, err)
 	})
 
 	// 0. check there are no peers
@@ -630,7 +652,7 @@ func TestSwitchAcceptRoutine(t *testing.T) {
 			}
 		}(c)
 	}
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, cfg.MaxNumInboundPeers, sw.Peers().Size())
 
 	// 2. check we close new connections if we already have MaxNumInboundPeers peers
@@ -640,10 +662,9 @@ func TestSwitchAcceptRoutine(t *testing.T) {
 	require.NoError(t, err)
 	// check conn is closed
 	one := make([]byte, 1)
-	err = conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	require.NoError(t, err)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	_, err = conn.Read(one)
-	assert.Equal(t, io.EOF, err)
+	assert.Error(t, err)
 	assert.Equal(t, cfg.MaxNumInboundPeers, sw.Peers().Size())
 	peer.Stop()
 
@@ -677,19 +698,23 @@ type errorTransport struct {
 	acceptErr error
 }
 
-func (et errorTransport) NetAddress() NetAddress {
-	panic("not implemented")
+func (et errorTransport) String() string {
+	return "error"
 }
 
-func (et errorTransport) Accept(c peerConfig) (Peer, error) {
+func (et errorTransport) Protocols() []Protocol {
+	return []Protocol{"error"}
+}
+
+func (et errorTransport) Accept() (Connection, error) {
 	return nil, et.acceptErr
 }
-func (errorTransport) Dial(NetAddress, peerConfig) (Peer, error) {
+func (errorTransport) Dial(context.Context, Endpoint) (Connection, error) {
 	panic("not implemented")
 }
-func (errorTransport) Cleanup(Peer) {
-	panic("not implemented")
-}
+func (errorTransport) Close() error          { panic("not implemented") }
+func (errorTransport) FlushClose() error     { panic("not implemented") }
+func (errorTransport) Endpoints() []Endpoint { panic("not implemented") }
 
 func TestSwitchAcceptRoutineErrorCases(t *testing.T) {
 	sw := NewSwitch(cfg, errorTransport{ErrFilterTimeout{}})
@@ -726,6 +751,10 @@ type mockReactor struct {
 	// atomic
 	removePeerInProgress           uint32
 	initCalledBeforeRemoveFinished uint32
+}
+
+func (r *mockReactor) GetChannels() []*ChannelDescriptor {
+	return []*ChannelDescriptor{{ID: testCh, Priority: 10}}
 }
 
 func (r *mockReactor) RemovePeer(peer Peer, reason interface{}) {

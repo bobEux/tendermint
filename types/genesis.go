@@ -11,8 +11,6 @@ import (
 	"github.com/tendermint/tendermint/crypto"
 	tmbytes "github.com/tendermint/tendermint/libs/bytes"
 	tmjson "github.com/tendermint/tendermint/libs/json"
-	tmos "github.com/tendermint/tendermint/libs/os"
-	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	tmtime "github.com/tendermint/tendermint/types/time"
 )
 
@@ -37,13 +35,13 @@ type GenesisValidator struct {
 
 // GenesisDoc defines the initial conditions for a tendermint blockchain, in particular its validator set.
 type GenesisDoc struct {
-	GenesisTime     time.Time                `json:"genesis_time"`
-	ChainID         string                   `json:"chain_id"`
-	InitialHeight   int64                    `json:"initial_height"`
-	ConsensusParams *tmproto.ConsensusParams `json:"consensus_params,omitempty"`
-	Validators      []GenesisValidator       `json:"validators,omitempty"`
-	AppHash         tmbytes.HexBytes         `json:"app_hash"`
-	AppState        json.RawMessage          `json:"app_state,omitempty"`
+	GenesisTime     time.Time          `json:"genesis_time"`
+	ChainID         string             `json:"chain_id"`
+	InitialHeight   int64              `json:"initial_height"`
+	ConsensusParams *ConsensusParams   `json:"consensus_params,omitempty"`
+	Validators      []GenesisValidator `json:"validators,omitempty"`
+	AppHash         tmbytes.HexBytes   `json:"app_hash"`
+	AppState        json.RawMessage    `json:"app_state,omitempty"`
 }
 
 // SaveAs is a utility method for saving GenensisDoc as a JSON file.
@@ -52,7 +50,8 @@ func (genDoc *GenesisDoc) SaveAs(file string) error {
 	if err != nil {
 		return err
 	}
-	return tmos.WriteFile(file, genDocBytes, 0644)
+
+	return ioutil.WriteFile(file, genDocBytes, 0644) // nolint:gosec
 }
 
 // ValidatorHash returns the hash of the validator set contained in the GenesisDoc
@@ -83,7 +82,7 @@ func (genDoc *GenesisDoc) ValidateAndComplete() error {
 
 	if genDoc.ConsensusParams == nil {
 		genDoc.ConsensusParams = DefaultConsensusParams()
-	} else if err := ValidateConsensusParams(*genDoc.ConsensusParams); err != nil {
+	} else if err := genDoc.ConsensusParams.ValidateConsensusParams(); err != nil {
 		return err
 	}
 

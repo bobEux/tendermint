@@ -18,12 +18,13 @@ import (
 	tmmath "github.com/tendermint/tendermint/libs/math"
 	tmsync "github.com/tendermint/tendermint/libs/sync"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	tmversion "github.com/tendermint/tendermint/proto/tendermint/version"
 	"github.com/tendermint/tendermint/version"
 )
 
 const (
 	// MaxHeaderBytes is a maximum header size.
+	// NOTE: Because app hash can be of arbitrary size, the header is therefore not
+	// capped in size and thus this number should be seen as a soft max
 	MaxHeaderBytes int64 = 626
 
 	// MaxOverheadForBlock - maximum overhead to encode a block (up to
@@ -303,6 +304,25 @@ func MaxDataBytesNoEvidence(maxBytes int64, valsCount int) int64 {
 	return maxDataBytes
 }
 
+// MakeBlock returns a new block with an empty header, except what can be
+// computed from itself.
+// It populates the same set of fields validated by ValidateBasic.
+func MakeBlock(height int64, txs []Tx, lastCommit *Commit, evidence []Evidence) *Block {
+	block := &Block{
+		Header: Header{
+			Version: version.Consensus{Block: version.BlockProtocol, App: 0},
+			Height:  height,
+		},
+		Data: Data{
+			Txs: txs,
+		},
+		Evidence:   EvidenceData{Evidence: evidence},
+		LastCommit: lastCommit,
+	}
+	block.fillHeader()
+	return block
+}
+
 //-----------------------------------------------------------------------------
 
 // Header defines the structure of a Tendermint block header.
@@ -312,10 +332,10 @@ func MaxDataBytesNoEvidence(maxBytes int64, valsCount int) int64 {
 // - https://github.com/tendermint/spec/blob/master/spec/blockchain/blockchain.md
 type Header struct {
 	// basic block info
-	Version tmversion.Consensus `json:"version"`
-	ChainID string              `json:"chain_id"`
-	Height  int64               `json:"height"`
-	Time    time.Time           `json:"time"`
+	Version version.Consensus `json:"version"`
+	ChainID string            `json:"chain_id"`
+	Height  int64             `json:"height"`
+	Time    time.Time         `json:"time"`
 
 	// prev block info
 	LastBlockID BlockID `json:"last_block_id"`
@@ -340,7 +360,7 @@ type Header struct {
 // Populate the Header with state-derived data.
 // Call this after MakeBlock to complete the Header.
 func (h *Header) Populate(
-	version tmversion.Consensus, chainID string,
+	version version.Consensus, chainID string,
 	timestamp time.Time, lastBlockID BlockID,
 	valHash, nextValHash []byte,
 	consensusHash, appHash, lastResultsHash []byte,
@@ -428,7 +448,8 @@ func (h *Header) Hash() tmbytes.HexBytes {
 	if h == nil || len(h.ValidatorsHash) == 0 {
 		return nil
 	}
-	hbz, err := h.Version.Marshal()
+	hpb := h.Version.ToProto()
+	hbz, err := hpb.Marshal()
 	if err != nil {
 		return nil
 	}
@@ -506,7 +527,7 @@ func (h *Header) ToProto() *tmproto.Header {
 	}
 
 	return &tmproto.Header{
-		Version:            h.Version,
+		Version:            h.Version.ToProto(),
 		ChainID:            h.ChainID,
 		Height:             h.Height,
 		Time:               h.Time,
@@ -537,7 +558,7 @@ func HeaderFromProto(ph *tmproto.Header) (Header, error) {
 		return Header{}, err
 	}
 
-	h.Version = ph.Version
+	h.Version = version.Consensus{Block: ph.Version.Block, App: ph.Version.App}
 	h.ChainID = ph.ChainID
 	h.Height = ph.Height
 	h.Time = ph.Time
@@ -573,9 +594,9 @@ const (
 const (
 	// Max size of commit without any commitSigs -> 82 for BlockID, 8 for Height, 4 for Round.
 	MaxCommitOverheadBytes int64 = 94
-	// Commit sig size is made up of 32 bytes for the signature, 20 bytes for the address,
+	// Commit sig size is made up of 64 bytes for the signature, 20 bytes for the address,
 	// 1 byte for the flag and 14 bytes for the timestamp
-	MaxCommitSigBytes int64 = 77
+	MaxCommitSigBytes int64 = 109
 )
 
 // CommitSig is a part of the Vote included in a Commit.
@@ -1106,12 +1127,12 @@ func (data *EvidenceData) StringIndented(indent string) string {
 }
 
 // ToProto converts EvidenceData to protobuf
-func (data *EvidenceData) ToProto() (*tmproto.EvidenceData, error) {
+func (data *EvidenceData) ToProto() (*tmproto.EvidenceList, error) {
 	if data == nil {
 		return nil, errors.New("nil evidence data")
 	}
 
-	evi := new(tmproto.EvidenceData)
+	evi := new(tmproto.EvidenceList)
 	eviBzs := make([]tmproto.Evidence, len(data.Evidence))
 	for i := range data.Evidence {
 		protoEvi, err := EvidenceToProto(data.Evidence[i])
@@ -1126,7 +1147,7 @@ func (data *EvidenceData) ToProto() (*tmproto.EvidenceData, error) {
 }
 
 // FromProto sets a protobuf EvidenceData to the given pointer.
-func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceData) error {
+func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceList) error {
 	if eviData == nil {
 		return errors.New("nil evidenceData")
 	}
@@ -1150,7 +1171,7 @@ func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceData) error {
 // BlockID
 type BlockID struct {
 	Hash          tmbytes.HexBytes `json:"hash"`
-	PartSetHeader PartSetHeader    `json:"parts"`
+	PartSetHeader PartSetHeader    `json:"part_set_header"`
 }
 
 // Equals returns true if the BlockID matches the given BlockID

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"fmt"
 	golog "log"
 	"net"
@@ -69,7 +70,6 @@ func TestPeerSend(t *testing.T) {
 		}
 	})
 
-	assert.True(p.CanSend(testCh))
 	assert.True(p.Send(testCh, []byte("Asylum")))
 }
 
@@ -81,20 +81,20 @@ func createOutboundPeerAndPerformHandshake(
 	chDescs := []*tmconn.ChannelDescriptor{
 		{ID: testCh, Priority: 1},
 	}
-	reactorsByCh := map[byte]Reactor{testCh: NewTestReactor(chDescs, true)}
 	pk := ed25519.GenPrivKey()
-	pc, err := testOutboundPeerConn(addr, config, false, pk)
+	ourNodeInfo := testNodeInfo(NodeIDFromPubKey(pk.PubKey()), "host_peer")
+	transport := NewMConnTransport(log.TestingLogger(), mConfig, chDescs, MConnTransportOptions{})
+	reactorsByCh := map[byte]Reactor{testCh: NewTestReactor(chDescs, true)}
+	pc, err := testOutboundPeerConn(transport, addr, config, false, pk)
 	if err != nil {
 		return nil, err
 	}
-	timeout := 1 * time.Second
-	ourNodeInfo := testNodeInfo(addr.ID, "host_peer")
-	peerNodeInfo, err := handshake(pc.conn, timeout, ourNodeInfo)
+	peerInfo, _, err := pc.conn.Handshake(context.Background(), ourNodeInfo, pk)
 	if err != nil {
 		return nil, err
 	}
 
-	p := newPeer(pc, mConfig, peerNodeInfo, reactorsByCh, chDescs, func(p Peer, r interface{}) {})
+	p := newPeer(peerInfo, pc, reactorsByCh, func(p Peer, r interface{}) {})
 	p.SetLogger(log.TestingLogger().With("peer", addr))
 	return p, nil
 }
@@ -112,6 +112,7 @@ func testDial(addr *NetAddress, cfg *config.P2PConfig) (net.Conn, error) {
 }
 
 func testOutboundPeerConn(
+	transport *MConnTransport,
 	addr *NetAddress,
 	config *config.P2PConfig,
 	persistent bool,
@@ -124,20 +125,12 @@ func testOutboundPeerConn(
 		return pc, fmt.Errorf("error creating peer: %w", err)
 	}
 
-	pc, err = testPeerConn(conn, config, true, persistent, ourNodePrivKey, addr)
+	pc, err = testPeerConn(transport, conn, true, persistent)
 	if err != nil {
 		if cerr := conn.Close(); cerr != nil {
 			return pc, fmt.Errorf("%v: %w", cerr.Error(), err)
 		}
 		return pc, err
-	}
-
-	// ensure dialed ID matches connection ID
-	if addr.ID != pc.ID() {
-		if cerr := conn.Close(); cerr != nil {
-			return pc, fmt.Errorf("%v: %w", cerr.Error(), err)
-		}
-		return pc, ErrSwitchAuthenticationFailure{addr, pc.ID()}
 	}
 
 	return pc, nil
@@ -156,8 +149,8 @@ func (rp *remotePeer) Addr() *NetAddress {
 	return rp.addr
 }
 
-func (rp *remotePeer) ID() ID {
-	return PubKeyToID(rp.PrivKey.PubKey())
+func (rp *remotePeer) ID() NodeID {
+	return NodeIDFromPubKey(rp.PrivKey.PubKey())
 }
 
 func (rp *remotePeer) Start() {
@@ -170,7 +163,7 @@ func (rp *remotePeer) Start() {
 		golog.Fatalf("net.Listen tcp :0: %+v", e)
 	}
 	rp.listener = l
-	rp.addr = NewNetAddress(PubKeyToID(rp.PrivKey.PubKey()), l.Addr())
+	rp.addr = NewNetAddress(NodeIDFromPubKey(rp.PrivKey.PubKey()), l.Addr())
 	if rp.channels == nil {
 		rp.channels = []byte{testCh}
 	}
@@ -182,15 +175,17 @@ func (rp *remotePeer) Stop() {
 }
 
 func (rp *remotePeer) Dial(addr *NetAddress) (net.Conn, error) {
+	transport := NewMConnTransport(log.TestingLogger(), MConnConfig(rp.Config),
+		[]*ChannelDescriptor{}, MConnTransportOptions{})
 	conn, err := addr.DialTimeout(1 * time.Second)
 	if err != nil {
 		return nil, err
 	}
-	pc, err := testInboundPeerConn(conn, rp.Config, rp.PrivKey)
+	pc, err := testInboundPeerConn(transport, conn)
 	if err != nil {
 		return nil, err
 	}
-	_, err = handshake(pc.conn, time.Second, rp.nodeInfo())
+	_, _, err = pc.conn.Handshake(context.Background(), rp.nodeInfo(), rp.PrivKey)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +193,8 @@ func (rp *remotePeer) Dial(addr *NetAddress) (net.Conn, error) {
 }
 
 func (rp *remotePeer) accept() {
+	transport := NewMConnTransport(log.TestingLogger(), MConnConfig(rp.Config),
+		[]*ChannelDescriptor{}, MConnTransportOptions{})
 	conns := []net.Conn{}
 
 	for {
@@ -210,14 +207,13 @@ func (rp *remotePeer) accept() {
 			return
 		}
 
-		pc, err := testInboundPeerConn(conn, rp.Config, rp.PrivKey)
+		pc, err := testInboundPeerConn(transport, conn)
 		if err != nil {
-			golog.Fatalf("Failed to create a peer: %+v", err)
+			golog.Printf("Failed to create a peer: %+v", err)
 		}
-
-		_, err = handshake(pc.conn, time.Second, rp.nodeInfo())
+		_, _, err = pc.conn.Handshake(context.Background(), rp.nodeInfo(), rp.PrivKey)
 		if err != nil {
-			golog.Fatalf("Failed to perform handshake: %+v", err)
+			golog.Printf("Failed to handshake a peer: %+v", err)
 		}
 
 		conns = append(conns, conn)
@@ -225,9 +221,9 @@ func (rp *remotePeer) accept() {
 }
 
 func (rp *remotePeer) nodeInfo() NodeInfo {
-	return DefaultNodeInfo{
+	return NodeInfo{
 		ProtocolVersion: defaultProtocolVersion,
-		DefaultNodeID:   rp.Addr().ID,
+		NodeID:          rp.Addr().ID,
 		ListenAddr:      rp.listener.Addr().String(),
 		Network:         "testing",
 		Version:         "1.2.3-rc0-deadbeef",

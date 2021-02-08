@@ -1,6 +1,7 @@
 package mempool
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -216,6 +217,63 @@ func TestMempoolUpdate(t *testing.T) {
 	}
 }
 
+func TestMempool_KeepInvalidTxsInCache(t *testing.T) {
+	app := counter.NewApplication(true)
+	cc := proxy.NewLocalClientCreator(app)
+	wcfg := cfg.DefaultConfig()
+	wcfg.Mempool.KeepInvalidTxsInCache = true
+	mempool, cleanup := newMempoolWithAppAndConfig(cc, wcfg)
+	defer cleanup()
+
+	// 1. An invalid transaction must remain in the cache after Update
+	{
+		a := make([]byte, 8)
+		binary.BigEndian.PutUint64(a, 0)
+
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, 1)
+
+		err := mempool.CheckTx(b, nil, TxInfo{})
+		require.NoError(t, err)
+
+		// simulate new block
+		_ = app.DeliverTx(abci.RequestDeliverTx{Tx: a})
+		_ = app.DeliverTx(abci.RequestDeliverTx{Tx: b})
+		err = mempool.Update(1, []types.Tx{a, b},
+			[]*abci.ResponseDeliverTx{{Code: abci.CodeTypeOK}, {Code: 2}}, nil, nil)
+		require.NoError(t, err)
+
+		// a must be added to the cache
+		err = mempool.CheckTx(a, nil, TxInfo{})
+		if assert.Error(t, err) {
+			assert.Equal(t, ErrTxInCache, err)
+		}
+
+		// b must remain in the cache
+		err = mempool.CheckTx(b, nil, TxInfo{})
+		if assert.Error(t, err) {
+			assert.Equal(t, ErrTxInCache, err)
+		}
+	}
+
+	// 2. An invalid transaction must remain in the cache
+	{
+		a := make([]byte, 8)
+		binary.BigEndian.PutUint64(a, 0)
+
+		// remove a from the cache to test (2)
+		mempool.cache.Remove(a)
+
+		err := mempool.CheckTx(a, nil, TxInfo{})
+		require.NoError(t, err)
+
+		err = mempool.CheckTx(a, nil, TxInfo{})
+		if assert.Error(t, err) {
+			assert.Equal(t, ErrTxInCache, err)
+		}
+	}
+}
+
 func TestTxsAvailable(t *testing.T) {
 	app := kvstore.NewApplication()
 	cc := proxy.NewLocalClientCreator(app)
@@ -313,11 +371,12 @@ func TestSerialReap(t *testing.T) {
 	}
 
 	commitRange := func(start, end int) {
+		ctx := context.Background()
 		// Deliver some txs.
 		for i := start; i < end; i++ {
 			txBytes := make([]byte, 8)
 			binary.BigEndian.PutUint64(txBytes, uint64(i))
-			res, err := appConnCon.DeliverTxSync(abci.RequestDeliverTx{Tx: txBytes})
+			res, err := appConnCon.DeliverTxSync(ctx, abci.RequestDeliverTx{Tx: txBytes})
 			if err != nil {
 				t.Errorf("client error committing tx: %v", err)
 			}
@@ -326,7 +385,7 @@ func TestSerialReap(t *testing.T) {
 					res.Code, res.Data, res.Log)
 			}
 		}
-		res, err := appConnCon.CommitSync()
+		res, err := appConnCon.CommitSync(ctx)
 		if err != nil {
 			t.Errorf("client error committing: %v", err)
 		}
@@ -520,10 +579,11 @@ func TestMempoolTxsBytes(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	res, err := appConnCon.DeliverTxSync(abci.RequestDeliverTx{Tx: txBytes})
+	ctx := context.Background()
+	res, err := appConnCon.DeliverTxSync(ctx, abci.RequestDeliverTx{Tx: txBytes})
 	require.NoError(t, err)
 	require.EqualValues(t, 0, res.Code)
-	res2, err := appConnCon.CommitSync()
+	res2, err := appConnCon.CommitSync(ctx)
 	require.NoError(t, err)
 	require.NotEmpty(t, res2.Data)
 

@@ -6,11 +6,14 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
 	"github.com/tendermint/tendermint/libs/log"
 	e2e "github.com/tendermint/tendermint/test/e2e/pkg"
 )
 
-var logger = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+var (
+	logger = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+)
 
 func main() {
 	NewCLI().Run()
@@ -18,8 +21,9 @@ func main() {
 
 // CLI is the Cobra-based command-line interface.
 type CLI struct {
-	root    *cobra.Command
-	testnet *e2e.Testnet
+	root     *cobra.Command
+	testnet  *e2e.Testnet
+	preserve bool
 }
 
 // NewCLI sets up the CLI.
@@ -65,11 +69,26 @@ func NewCLI() *CLI {
 			if err := Start(cli.testnet); err != nil {
 				return err
 			}
-			if err := Perturb(cli.testnet); err != nil {
-				return err
+
+			if lastMisbehavior := cli.testnet.LastMisbehaviorHeight(); lastMisbehavior > 0 {
+				// wait for misbehaviors before starting perturbations. We do a separate
+				// wait for another 5 blocks, since the last misbehavior height may be
+				// in the past depending on network startup ordering.
+				if err := WaitUntil(cli.testnet, lastMisbehavior); err != nil {
+					return err
+				}
 			}
 			if err := Wait(cli.testnet, 5); err != nil { // allow some txs to go through
 				return err
+			}
+
+			if cli.testnet.HasPerturbations() {
+				if err := Perturb(cli.testnet); err != nil {
+					return err
+				}
+				if err := Wait(cli.testnet, 5); err != nil { // allow some txs to go through
+					return err
+				}
 			}
 
 			loadCancel()
@@ -82,8 +101,10 @@ func NewCLI() *CLI {
 			if err := Test(cli.testnet); err != nil {
 				return err
 			}
-			if err := Cleanup(cli.testnet); err != nil {
-				return err
+			if !cli.preserve {
+				if err := Cleanup(cli.testnet); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
@@ -91,6 +112,14 @@ func NewCLI() *CLI {
 
 	cli.root.PersistentFlags().StringP("file", "f", "", "Testnet TOML manifest")
 	_ = cli.root.MarkPersistentFlagRequired("file")
+
+	cli.root.Flags().BoolVarP(&cli.preserve, "preserve", "p", false,
+		"Preserves the running of the test net after tests are completed")
+
+	cli.root.SetHelpCommand(&cobra.Command{
+		Use:    "no-help",
+		Hidden: true,
+	})
 
 	cli.root.AddCommand(&cobra.Command{
 		Use:   "setup",
@@ -165,17 +194,26 @@ func NewCLI() *CLI {
 	})
 
 	cli.root.AddCommand(&cobra.Command{
-		Use:   "logs",
-		Short: "Shows the testnet logs",
+		Use:     "logs [node]",
+		Short:   "Shows the testnet or a specefic node's logs",
+		Example: "runner logs validator03",
+		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				return execComposeVerbose(cli.testnet.Dir, "logs", args[0])
+			}
 			return execComposeVerbose(cli.testnet.Dir, "logs")
 		},
 	})
 
 	cli.root.AddCommand(&cobra.Command{
-		Use:   "tail",
-		Short: "Tails the testnet logs",
+		Use:   "tail [node]",
+		Short: "Tails the testnet or a specific node's logs",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				return execComposeVerbose(cli.testnet.Dir, "logs", "--follow", args[0])
+			}
 			return execComposeVerbose(cli.testnet.Dir, "logs", "--follow")
 		},
 	})

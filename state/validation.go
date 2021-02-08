@@ -11,7 +11,7 @@ import (
 //-----------------------------------------------------
 // Validate block
 
-func validateBlock(evidencePool EvidencePool, state State, block *types.Block) error {
+func validateBlock(state State, block *types.Block) error {
 	// Validate internal consistency.
 	if err := block.ValidateBasic(); err != nil {
 		return err
@@ -56,7 +56,7 @@ func validateBlock(evidencePool EvidencePool, state State, block *types.Block) e
 			block.AppHash,
 		)
 	}
-	hashCP := types.HashConsensusParams(state.ConsensusParams)
+	hashCP := state.ConsensusParams.HashConsensusParams()
 	if !bytes.Equal(block.ConsensusHash, hashCP) {
 		return fmt.Errorf("wrong Block.Header.ConsensusHash.  Expected %X, got %v",
 			hashCP,
@@ -141,6 +141,5 @@ func validateBlock(evidencePool EvidencePool, state State, block *types.Block) e
 		return types.NewErrEvidenceOverflow(max, got)
 	}
 
-	// Validate all evidence.
-	return evidencePool.CheckEvidence(block.Evidence.Evidence)
+	return nil
 }

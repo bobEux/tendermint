@@ -52,53 +52,6 @@ func TestABCIValidators(t *testing.T) {
 	assert.Equal(t, tmValExpected, tmVals[0])
 }
 
-func TestABCIConsensusParams(t *testing.T) {
-	cp := DefaultConsensusParams()
-	abciCP := TM2PB.ConsensusParams(cp)
-	cp2 := UpdateConsensusParams(*cp, abciCP)
-
-	assert.Equal(t, *cp, cp2)
-}
-
-func TestABCIEvidence(t *testing.T) {
-	val := NewMockPV()
-	blockID := makeBlockID([]byte("blockhash"), 1000, []byte("partshash"))
-	blockID2 := makeBlockID([]byte("blockhash2"), 1000, []byte("partshash"))
-	const chainID = "mychain"
-	pubKey, err := val.GetPubKey()
-	require.NoError(t, err)
-	ev := &DuplicateVoteEvidence{
-		VoteA: makeVote(t, val, chainID, 0, 10, 2, 1, blockID, defaultVoteTime),
-		VoteB: makeVote(t, val, chainID, 0, 10, 2, 1, blockID2, defaultVoteTime),
-	}
-	abciEv := TM2PB.Evidence(
-		ev,
-		NewValidatorSet([]*Validator{NewValidator(pubKey, 10)}),
-	)
-
-	assert.Equal(t, abci.EvidenceType_DUPLICATE_VOTE, abciEv.Type)
-	assert.Equal(t, ev.Height(), abciEv.GetHeight())
-}
-
-type pubKeyEddie struct{}
-
-func (pubKeyEddie) Address() Address                            { return []byte{} }
-func (pubKeyEddie) Bytes() []byte                               { return []byte{} }
-func (pubKeyEddie) VerifySignature(msg []byte, sig []byte) bool { return false }
-func (pubKeyEddie) Equals(crypto.PubKey) bool                   { return false }
-func (pubKeyEddie) String() string                              { return "" }
-func (pubKeyEddie) Type() string                                { return "pubKeyEddie" }
-
-func TestABCIValidatorFromPubKeyAndPower(t *testing.T) {
-	pubkey := ed25519.GenPrivKey().PubKey()
-
-	abciVal := TM2PB.NewValidatorUpdate(pubkey, 10)
-	assert.Equal(t, int64(10), abciVal.Power)
-
-	assert.Panics(t, func() { TM2PB.NewValidatorUpdate(nil, 10) })
-	assert.Panics(t, func() { TM2PB.NewValidatorUpdate(pubKeyEddie{}, 10) })
-}
-
 func TestABCIValidatorWithoutPubKey(t *testing.T) {
 	pkEd := ed25519.GenPrivKey().PubKey()
 

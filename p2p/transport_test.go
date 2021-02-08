@@ -1,691 +1,641 @@
-package p2p
+package p2p_test
 
 import (
-	"fmt"
-	"math/rand"
+	"context"
+	"io"
 	"net"
-	"reflect"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/fortytw2/leaktest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/tendermint/tendermint/crypto/ed25519"
-	"github.com/tendermint/tendermint/libs/protoio"
-	"github.com/tendermint/tendermint/p2p/conn"
-	tmp2p "github.com/tendermint/tendermint/proto/tendermint/p2p"
+	"github.com/tendermint/tendermint/libs/bytes"
+	"github.com/tendermint/tendermint/p2p"
 )
 
-var defaultNodeName = "host_peer"
+// transportFactory is used to set up transports for tests.
+type transportFactory func(t *testing.T) p2p.Transport
 
-func emptyNodeInfo() NodeInfo {
-	return DefaultNodeInfo{}
-}
+// testTransports is a registry of transport factories for withTransports().
+var testTransports = map[string]transportFactory{}
 
-// newMultiplexTransport returns a tcp connected multiplexed peer
-// using the default MConnConfig. It's a convenience function used
-// for testing.
-func newMultiplexTransport(
-	nodeInfo NodeInfo,
-	nodeKey NodeKey,
-) *MultiplexTransport {
-	return NewMultiplexTransport(
-		nodeInfo, nodeKey, conn.DefaultMConnConfig(),
-	)
-}
-
-func TestTransportMultiplexConnFilter(t *testing.T) {
-	mt := newMultiplexTransport(
-		emptyNodeInfo(),
-		NodeKey{
-			PrivKey: ed25519.GenPrivKey(),
-		},
-	)
-	id := mt.nodeKey.ID()
-
-	MultiplexTransportConnFilters(
-		func(_ ConnSet, _ net.Conn, _ []net.IP) error { return nil },
-		func(_ ConnSet, _ net.Conn, _ []net.IP) error { return nil },
-		func(_ ConnSet, _ net.Conn, _ []net.IP) error {
-			return fmt.Errorf("rejected")
-		},
-	)(mt)
-
-	addr, err := NewNetAddressString(IDAddressString(id, "127.0.0.1:0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := mt.Listen(*addr); err != nil {
-		t.Fatal(err)
-	}
-
-	errc := make(chan error)
-
-	go func() {
-		addr := NewNetAddress(id, mt.listener.Addr())
-
-		_, err := addr.Dial()
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(errc)
-	}()
-
-	if err := <-errc; err != nil {
-		t.Errorf("connection failed: %v", err)
-	}
-
-	_, err = mt.Accept(peerConfig{})
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsFiltered() {
-			t.Errorf("expected peer to be filtered, got %v", err)
-		}
-	} else {
-		t.Errorf("expected ErrRejected, got %v", err)
+// withTransports is a test helper that runs a test against all transports
+// registered in testTransports.
+func withTransports(t *testing.T, tester func(*testing.T, transportFactory)) {
+	t.Helper()
+	for name, transportFactory := range testTransports {
+		transportFactory := transportFactory
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(leaktest.Check(t))
+			tester(t, transportFactory)
+		})
 	}
 }
 
-func TestTransportMultiplexConnFilterTimeout(t *testing.T) {
-	mt := newMultiplexTransport(
-		emptyNodeInfo(),
-		NodeKey{
-			PrivKey: ed25519.GenPrivKey(),
-		},
-	)
-	id := mt.nodeKey.ID()
+func TestTransport_AcceptClose(t *testing.T) {
+	// Just test accept unblock on close, happy path is tested widely elsewhere.
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
 
-	MultiplexTransportFilterTimeout(5 * time.Millisecond)(mt)
-	MultiplexTransportConnFilters(
-		func(_ ConnSet, _ net.Conn, _ []net.IP) error {
-			time.Sleep(1 * time.Second)
-			return nil
-		},
-	)(mt)
-
-	addr, err := NewNetAddressString(IDAddressString(id, "127.0.0.1:0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := mt.Listen(*addr); err != nil {
-		t.Fatal(err)
-	}
-
-	errc := make(chan error)
-	go func() {
-		addr := NewNetAddress(id, mt.listener.Addr())
-
-		_, err := addr.Dial()
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(errc)
-	}()
-
-	if err := <-errc; err != nil {
-		t.Errorf("connection failed: %v", err)
-	}
-
-	_, err = mt.Accept(peerConfig{})
-	if _, ok := err.(ErrFilterTimeout); !ok {
-		t.Errorf("expected ErrFilterTimeout, got %v", err)
-	}
-}
-
-func TestTransportMultiplexMaxIncomingConnections(t *testing.T) {
-	pv := ed25519.GenPrivKey()
-	id := PubKeyToID(pv.PubKey())
-	mt := newMultiplexTransport(
-		testNodeInfo(
-			id, "transport",
-		),
-		NodeKey{
-			PrivKey: pv,
-		},
-	)
-
-	MultiplexTransportMaxIncomingConnections(0)(mt)
-
-	addr, err := NewNetAddressString(IDAddressString(id, "127.0.0.1:0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	const maxIncomingConns = 2
-	MultiplexTransportMaxIncomingConnections(maxIncomingConns)(mt)
-	if err := mt.Listen(*addr); err != nil {
-		t.Fatal(err)
-	}
-
-	laddr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-	// Connect more peers than max
-	for i := 0; i <= maxIncomingConns; i++ {
-		errc := make(chan error)
-		go testDialer(*laddr, errc)
-
-		err = <-errc
-		if i < maxIncomingConns {
-			if err != nil {
-				t.Errorf("dialer connection failed: %v", err)
-			}
-			_, err = mt.Accept(peerConfig{})
-			if err != nil {
-				t.Errorf("connection failed: %v", err)
-			}
-		} else if err == nil || !strings.Contains(err.Error(), "i/o timeout") {
-			// mt actually blocks forever on trying to accept a new peer into a full channel so
-			// expect the dialer to encounter a timeout error. Calling mt.Accept will block until
-			// mt is closed.
-			t.Errorf("expected i/o timeout error, got %v", err)
-		}
-	}
-}
-
-func TestTransportMultiplexAcceptMultiple(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
-	laddr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-	var (
-		seed     = rand.New(rand.NewSource(time.Now().UnixNano()))
-		nDialers = seed.Intn(64) + 64
-		errc     = make(chan error, nDialers)
-	)
-
-	// Setup dialers.
-	for i := 0; i < nDialers; i++ {
-		go testDialer(*laddr, errc)
-	}
-
-	// Catch connection errors.
-	for i := 0; i < nDialers; i++ {
-		if err := <-errc; err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ps := []Peer{}
-
-	// Accept all peers.
-	for i := 0; i < cap(errc); i++ {
-		p, err := mt.Accept(peerConfig{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := p.Start(); err != nil {
-			t.Fatal(err)
-		}
-
-		ps = append(ps, p)
-	}
-
-	if have, want := len(ps), cap(errc); have != want {
-		t.Errorf("have %v, want %v", have, want)
-	}
-
-	// Stop all peers.
-	for _, p := range ps {
-		if err := p.Stop(); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if err := mt.Close(); err != nil {
-		t.Errorf("close errored: %v", err)
-	}
-}
-
-func testDialer(dialAddr NetAddress, errc chan error) {
-	var (
-		pv     = ed25519.GenPrivKey()
-		dialer = newMultiplexTransport(
-			testNodeInfo(PubKeyToID(pv.PubKey()), defaultNodeName),
-			NodeKey{
-				PrivKey: pv,
-			},
-		)
-	)
-
-	_, err := dialer.Dial(dialAddr, peerConfig{})
-	if err != nil {
-		errc <- err
-		return
-	}
-
-	// Signal that the connection was established.
-	errc <- nil
-}
-
-func TestTransportMultiplexAcceptNonBlocking(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
-
-	var (
-		fastNodePV   = ed25519.GenPrivKey()
-		fastNodeInfo = testNodeInfo(PubKeyToID(fastNodePV.PubKey()), "fastnode")
-		errc         = make(chan error)
-		fastc        = make(chan struct{})
-		slowc        = make(chan struct{})
-		slowdonec    = make(chan struct{})
-	)
-
-	// Simulate slow Peer.
-	go func() {
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		c, err := addr.Dial()
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(slowc)
-		defer func() {
-			close(slowdonec)
+		// In-progress Accept should error on concurrent close.
+		errCh := make(chan error, 1)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			errCh <- a.Close()
 		}()
 
-		// Make sure we switch to fast peer goroutine.
-		runtime.Gosched()
+		_, err := a.Accept()
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+		require.NoError(t, <-errCh)
 
-		select {
-		case <-fastc:
-			// Fast peer connected.
-		case <-time.After(200 * time.Millisecond):
-			// We error if the fast peer didn't succeed.
-			errc <- fmt.Errorf("fast peer timed out")
-		}
-
-		sc, err := upgradeSecretConn(c, 200*time.Millisecond, ed25519.GenPrivKey())
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		_, err = handshake(sc, 200*time.Millisecond,
-			testNodeInfo(
-				PubKeyToID(ed25519.GenPrivKey().PubKey()),
-				"slow_peer",
-			))
-		if err != nil {
-			errc <- err
-		}
-	}()
-
-	// Simulate fast Peer.
-	go func() {
-		<-slowc
-
-		var (
-			dialer = newMultiplexTransport(
-				fastNodeInfo,
-				NodeKey{
-					PrivKey: fastNodePV,
-				},
-			)
-		)
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		_, err := dialer.Dial(*addr, peerConfig{})
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(fastc)
-		<-slowdonec
-		close(errc)
-	}()
-
-	if err := <-errc; err != nil {
-		t.Logf("connection failed: %v", err)
-	}
-
-	p, err := mt.Accept(peerConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if have, want := p.NodeInfo(), fastNodeInfo; !reflect.DeepEqual(have, want) {
-		t.Errorf("have %v, want %v", have, want)
-	}
+		// Closed transport should return error immediately.
+		_, err = a.Accept()
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+	})
 }
 
-func TestTransportMultiplexValidateNodeInfo(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
+func TestTransport_DialEndpoints(t *testing.T) {
+	ipTestCases := []struct {
+		ip net.IP
+		ok bool
+	}{
+		{net.IPv4zero, true},
+		{net.IPv6zero, true},
 
-	errc := make(chan error)
-
-	go func() {
-		var (
-			pv     = ed25519.GenPrivKey()
-			dialer = newMultiplexTransport(
-				testNodeInfo(PubKeyToID(pv.PubKey()), ""), // Should not be empty
-				NodeKey{
-					PrivKey: pv,
-				},
-			)
-		)
-
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		_, err := dialer.Dial(*addr, peerConfig{})
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(errc)
-	}()
-
-	if err := <-errc; err != nil {
-		t.Errorf("connection failed: %v", err)
+		{nil, false},
+		{net.IPv4bcast, false},
+		{net.IPv4allsys, false},
+		{[]byte{1, 2, 3}, false},
+		{[]byte{1, 2, 3, 4, 5}, false},
 	}
 
-	_, err := mt.Accept(peerConfig{})
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsNodeInfoInvalid() {
-			t.Errorf("expected NodeInfo to be invalid, got %v", err)
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		endpoints := a.Endpoints()
+		require.NotEmpty(t, endpoints)
+		endpoint := endpoints[0]
+
+		// Spawn a goroutine to simply accept any connections until closed.
+		go func() {
+			for {
+				conn, err := a.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+
+		// Dialing self should work.
+		conn, err := a.Dial(ctx, endpoint)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+
+		// Dialing empty endpoint should error.
+		_, err = a.Dial(ctx, p2p.Endpoint{})
+		require.Error(t, err)
+
+		// Dialing without protocol should error.
+		noProtocol := endpoint
+		noProtocol.Protocol = ""
+		_, err = a.Dial(ctx, noProtocol)
+		require.Error(t, err)
+
+		// Dialing with invalid protocol should error.
+		fooProtocol := endpoint
+		fooProtocol.Protocol = "foo"
+		_, err = a.Dial(ctx, fooProtocol)
+		require.Error(t, err)
+
+		// Tests for networked endpoints (with IP).
+		if len(endpoint.IP) > 0 {
+			for _, tc := range ipTestCases {
+				tc := tc
+				t.Run(tc.ip.String(), func(t *testing.T) {
+					e := endpoint
+					e.IP = tc.ip
+					conn, err := a.Dial(ctx, e)
+					if tc.ok {
+						require.NoError(t, conn.Close())
+						require.NoError(t, err)
+					} else {
+						require.Error(t, err)
+					}
+				})
+			}
+
+			// Non-networked endpoints should error.
+			noIP := endpoint
+			noIP.IP = nil
+			noIP.Port = 0
+			noIP.Path = "foo"
+			_, err := a.Dial(ctx, noIP)
+			require.Error(t, err)
+
+		} else {
+			// Tests for non-networked endpoints (no IP).
+			noPath := endpoint
+			noPath.Path = ""
+			_, err = a.Dial(ctx, noPath)
+			require.Error(t, err)
 		}
-	} else {
-		t.Errorf("expected ErrRejected, got %v", err)
-	}
+	})
 }
 
-func TestTransportMultiplexRejectMissmatchID(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
+func TestTransport_Dial(t *testing.T) {
+	// Most just tests dial failures, happy path is tested widely elsewhere.
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
 
-	errc := make(chan error)
+		require.NotEmpty(t, a.Endpoints())
+		require.NotEmpty(t, b.Endpoints())
+		aEndpoint := a.Endpoints()[0]
+		bEndpoint := b.Endpoints()[0]
 
-	go func() {
-		dialer := newMultiplexTransport(
-			testNodeInfo(
-				PubKeyToID(ed25519.GenPrivKey().PubKey()), "dialer",
-			),
-			NodeKey{
-				PrivKey: ed25519.GenPrivKey(),
+		// Context cancellation should error. We can't test timeouts since we'd
+		// need a non-responsive endpoint.
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := a.Dial(cancelCtx, bEndpoint)
+		require.Error(t, err)
+		require.Equal(t, err, context.Canceled)
+
+		// Unavailable endpoint should error.
+		err = b.Close()
+		require.NoError(t, err)
+		_, err = a.Dial(ctx, bEndpoint)
+		require.Error(t, err)
+
+		// Dialing from a closed transport should still work.
+		errCh := make(chan error, 1)
+		go func() {
+			conn, err := a.Accept()
+			if err == nil {
+				_ = conn.Close()
+			}
+			errCh <- err
+		}()
+		conn, err := b.Dial(ctx, aEndpoint)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+		require.NoError(t, <-errCh)
+	})
+}
+
+func TestTransport_Endpoints(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+
+		// Both transports return valid and different endpoints.
+		aEndpoints := a.Endpoints()
+		bEndpoints := b.Endpoints()
+		require.NotEmpty(t, aEndpoints)
+		require.NotEmpty(t, bEndpoints)
+		require.NotEqual(t, aEndpoints, bEndpoints)
+		for _, endpoint := range append(aEndpoints, bEndpoints...) {
+			err := endpoint.Validate()
+			require.NoError(t, err, "invalid endpoint %q", endpoint)
+		}
+
+		// When closed, the transport should no longer return any endpoints.
+		err := a.Close()
+		require.NoError(t, err)
+		require.Empty(t, a.Endpoints())
+		require.NotEmpty(t, b.Endpoints())
+	})
+}
+
+func TestTransport_Protocols(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		protocols := a.Protocols()
+		endpoints := a.Endpoints()
+		require.NotEmpty(t, protocols)
+		require.NotEmpty(t, endpoints)
+
+		for _, endpoint := range endpoints {
+			require.Contains(t, protocols, endpoint.Protocol)
+		}
+	})
+}
+
+func TestTransport_String(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		require.NotEmpty(t, a.String())
+	})
+}
+
+func TestConnection_Handshake(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, ba := dialAccept(t, a, b)
+
+		// A handshake should pass the given keys and NodeInfo.
+		aKey := ed25519.GenPrivKey()
+		aInfo := p2p.NodeInfo{
+			NodeID:          p2p.NodeIDFromPubKey(aKey.PubKey()),
+			ProtocolVersion: p2p.NewProtocolVersion(1, 2, 3),
+			ListenAddr:      "listenaddr",
+			Network:         "network",
+			Version:         "1.2.3",
+			Channels:        bytes.HexBytes([]byte{0xf0, 0x0f}),
+			Moniker:         "moniker",
+			Other: p2p.NodeInfoOther{
+				TxIndex:    "txindex",
+				RPCAddress: "rpc.domain.com",
 			},
-		)
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		_, err := dialer.Dial(*addr, peerConfig{})
-		if err != nil {
-			errc <- err
-			return
 		}
+		bKey := ed25519.GenPrivKey()
+		bInfo := p2p.NodeInfo{NodeID: p2p.NodeIDFromPubKey(bKey.PubKey())}
 
-		close(errc)
-	}()
+		errCh := make(chan error, 1)
+		go func() {
+			// Must use assert due to goroutine.
+			peerInfo, peerKey, err := ba.Handshake(ctx, bInfo, bKey)
+			if err == nil {
+				assert.Equal(t, aInfo, peerInfo)
+				assert.Equal(t, aKey.PubKey(), peerKey)
+			}
+			errCh <- err
+		}()
 
-	if err := <-errc; err != nil {
-		t.Errorf("connection failed: %v", err)
-	}
+		peerInfo, peerKey, err := ab.Handshake(ctx, aInfo, aKey)
+		require.NoError(t, err)
+		require.Equal(t, bInfo, peerInfo)
+		require.Equal(t, bKey.PubKey(), peerKey)
 
-	_, err := mt.Accept(peerConfig{})
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsAuthFailure() {
-			t.Errorf("expected auth failure, got %v", err)
-		}
-	} else {
-		t.Errorf("expected ErrRejected, got %v", err)
-	}
+		require.NoError(t, <-errCh)
+	})
 }
 
-func TestTransportMultiplexDialRejectWrongID(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
+func TestConnection_HandshakeCancel(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
 
+		// Handshake should error on context cancellation.
+		ab, ba := dialAccept(t, a, b)
+		timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+		cancel()
+		_, _, err := ab.Handshake(timeoutCtx, p2p.NodeInfo{}, ed25519.GenPrivKey())
+		require.Error(t, err)
+		require.Equal(t, context.Canceled, err)
+		_ = ab.Close()
+		_ = ba.Close()
+
+		// Handshake should error on context timeout.
+		ab, ba = dialAccept(t, a, b)
+		timeoutCtx, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		_, _, err = ab.Handshake(timeoutCtx, p2p.NodeInfo{}, ed25519.GenPrivKey())
+		require.Error(t, err)
+		require.Equal(t, context.DeadlineExceeded, err)
+		_ = ab.Close()
+		_ = ba.Close()
+	})
+}
+
+func TestConnection_FlushClose(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, _ := dialAcceptHandshake(t, a, b)
+
+		// FIXME: FlushClose should be removed (and replaced by separate Flush
+		// and Close calls if necessary). We can't reliably test it, so we just
+		// make sure it closes both ends and that it's idempotent.
+		err := ab.FlushClose()
+		require.NoError(t, err)
+
+		_, _, err = ab.ReceiveMessage()
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+
+		_, err = ab.SendMessage(chID, []byte("closed"))
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+
+		err = ab.FlushClose()
+		require.NoError(t, err)
+	})
+}
+
+func TestConnection_LocalRemoteEndpoint(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, ba := dialAcceptHandshake(t, a, b)
+
+		// Local and remote connection endpoints correspond to each other.
+		require.NotEmpty(t, ab.LocalEndpoint())
+		require.NotEmpty(t, ba.LocalEndpoint())
+		require.Equal(t, ab.LocalEndpoint(), ba.RemoteEndpoint())
+		require.Equal(t, ab.RemoteEndpoint(), ba.LocalEndpoint())
+	})
+}
+
+func TestConnection_SendReceive(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, ba := dialAcceptHandshake(t, a, b)
+
+		// Can send and receive a to b.
+		ok, err := ab.SendMessage(chID, []byte("foo"))
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		ch, msg, err := ba.ReceiveMessage()
+		require.NoError(t, err)
+		require.Equal(t, []byte("foo"), msg)
+		require.Equal(t, chID, ch)
+
+		// Can send and receive b to a.
+		_, err = ba.SendMessage(chID, []byte("bar"))
+		require.NoError(t, err)
+
+		_, msg, err = ab.ReceiveMessage()
+		require.NoError(t, err)
+		require.Equal(t, []byte("bar"), msg)
+
+		// TrySendMessage also works.
+		ok, err = ba.TrySendMessage(chID, []byte("try"))
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		ch, msg, err = ab.ReceiveMessage()
+		require.NoError(t, err)
+		require.Equal(t, []byte("try"), msg)
+		require.Equal(t, chID, ch)
+
+		// Connections should still be active after closing the transports.
+		err = a.Close()
+		require.NoError(t, err)
+		err = b.Close()
+		require.NoError(t, err)
+
+		_, err = ab.SendMessage(chID, []byte("still here"))
+		require.NoError(t, err)
+		ch, msg, err = ba.ReceiveMessage()
+		require.NoError(t, err)
+		require.Equal(t, chID, ch)
+		require.Equal(t, []byte("still here"), msg)
+
+		// Close one side of the connection. Both sides should then error
+		// with io.EOF when trying to send or receive.
+		err = ba.Close()
+		require.NoError(t, err)
+
+		_, _, err = ab.ReceiveMessage()
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+		_, err = ab.SendMessage(chID, []byte("closed"))
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+
+		_, _, err = ba.ReceiveMessage()
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+		_, err = ba.SendMessage(chID, []byte("closed"))
+		require.Error(t, err)
+		require.Equal(t, io.EOF, err)
+	})
+}
+
+func TestConnection_Status(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, _ := dialAcceptHandshake(t, a, b)
+
+		// FIXME: This isn't implemented in all transports, so for now we just
+		// check that it doesn't panic, which isn't really much of a test.
+		ab.Status()
+	})
+}
+
+func TestConnection_String(t *testing.T) {
+	withTransports(t, func(t *testing.T, makeTransport transportFactory) {
+		a := makeTransport(t)
+		b := makeTransport(t)
+		ab, _ := dialAccept(t, a, b)
+		require.NotEmpty(t, ab.String())
+	})
+}
+
+func TestEndpoint_NodeAddress(t *testing.T) {
 	var (
-		pv     = ed25519.GenPrivKey()
-		dialer = newMultiplexTransport(
-			testNodeInfo(PubKeyToID(pv.PubKey()), ""), // Should not be empty
-			NodeKey{
-				PrivKey: pv,
-			},
-		)
+		ip4    = []byte{1, 2, 3, 4}
+		ip4in6 = net.IPv4(1, 2, 3, 4)
+		ip6    = []byte{0xb1, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+		id     = p2p.NodeID("00112233445566778899aabbccddeeff00112233")
 	)
 
-	wrongID := PubKeyToID(ed25519.GenPrivKey().PubKey())
-	addr := NewNetAddress(wrongID, mt.listener.Addr())
+	testcases := []struct {
+		endpoint p2p.Endpoint
+		expect   p2p.NodeAddress
+	}{
+		// Valid endpoints.
+		{
+			p2p.Endpoint{Protocol: "tcp", IP: ip4, Port: 8080, Path: "path"},
+			p2p.NodeAddress{Protocol: "tcp", Hostname: "1.2.3.4", Port: 8080, Path: "path"},
+		},
+		{
+			p2p.Endpoint{Protocol: "tcp", IP: ip4in6, Port: 8080, Path: "path"},
+			p2p.NodeAddress{Protocol: "tcp", Hostname: "1.2.3.4", Port: 8080, Path: "path"},
+		},
+		{
+			p2p.Endpoint{Protocol: "tcp", IP: ip6, Port: 8080, Path: "path"},
+			p2p.NodeAddress{Protocol: "tcp", Hostname: "b10c::1", Port: 8080, Path: "path"},
+		},
+		{
+			p2p.Endpoint{Protocol: "memory", Path: "foo"},
+			p2p.NodeAddress{Protocol: "memory", Path: "foo"},
+		},
+		{
+			p2p.Endpoint{Protocol: "memory", Path: string(id)},
+			p2p.NodeAddress{Protocol: "memory", Path: string(id)},
+		},
 
-	_, err := dialer.Dial(*addr, peerConfig{})
-	if err != nil {
-		t.Logf("connection failed: %v", err)
-		if err, ok := err.(ErrRejected); ok {
-			if !err.IsAuthFailure() {
-				t.Errorf("expected auth failure, got %v", err)
-			}
-		} else {
-			t.Errorf("expected ErrRejected, got %v", err)
-		}
+		// Partial (invalid) endpoints.
+		{p2p.Endpoint{}, p2p.NodeAddress{}},
+		{p2p.Endpoint{Protocol: "tcp"}, p2p.NodeAddress{Protocol: "tcp"}},
+		{p2p.Endpoint{IP: net.IPv4(1, 2, 3, 4)}, p2p.NodeAddress{Hostname: "1.2.3.4"}},
+		{p2p.Endpoint{Port: 8080}, p2p.NodeAddress{}},
+		{p2p.Endpoint{Path: "path"}, p2p.NodeAddress{Path: "path"}},
+	}
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.endpoint.String(), func(t *testing.T) {
+			// Without NodeID.
+			expect := tc.expect
+			require.Equal(t, expect, tc.endpoint.NodeAddress(""))
+
+			// With NodeID.
+			expect.NodeID = id
+			require.Equal(t, expect, tc.endpoint.NodeAddress(expect.NodeID))
+		})
 	}
 }
 
-func TestTransportMultiplexRejectIncompatible(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
-
-	errc := make(chan error)
-
-	go func() {
-		var (
-			pv     = ed25519.GenPrivKey()
-			dialer = newMultiplexTransport(
-				testNodeInfoWithNetwork(PubKeyToID(pv.PubKey()), "dialer", "incompatible-network"),
-				NodeKey{
-					PrivKey: pv,
-				},
-			)
-		)
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		_, err := dialer.Dial(*addr, peerConfig{})
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(errc)
-	}()
-
-	_, err := mt.Accept(peerConfig{})
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsIncompatible() {
-			t.Errorf("expected to reject incompatible, got %v", err)
-		}
-	} else {
-		t.Errorf("expected ErrRejected, got %v", err)
-	}
-}
-
-func TestTransportMultiplexRejectSelf(t *testing.T) {
-	mt := testSetupMultiplexTransport(t)
-
-	errc := make(chan error)
-
-	go func() {
-		addr := NewNetAddress(mt.nodeKey.ID(), mt.listener.Addr())
-
-		_, err := mt.Dial(*addr, peerConfig{})
-		if err != nil {
-			errc <- err
-			return
-		}
-
-		close(errc)
-	}()
-
-	if err := <-errc; err != nil {
-		if err, ok := err.(ErrRejected); ok {
-			if !err.IsSelf() {
-				t.Errorf("expected to reject self, got: %v", err)
-			}
-		} else {
-			t.Errorf("expected ErrRejected, got %v", err)
-		}
-	} else {
-		t.Errorf("expected connection failure")
-	}
-
-	_, err := mt.Accept(peerConfig{})
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsSelf() {
-			t.Errorf("expected to reject self, got: %v", err)
-		}
-	} else {
-		t.Errorf("expected ErrRejected, got %v", nil)
-	}
-}
-
-func TestTransportConnDuplicateIPFilter(t *testing.T) {
-	filter := ConnDuplicateIPFilter()
-
-	if err := filter(nil, &testTransportConn{}, nil); err != nil {
-		t.Fatal(err)
-	}
-
+func TestEndpoint_String(t *testing.T) {
 	var (
-		c  = &testTransportConn{}
-		cs = NewConnSet()
+		ip4    = []byte{1, 2, 3, 4}
+		ip4in6 = net.IPv4(1, 2, 3, 4)
+		ip6    = []byte{0xb1, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+		nodeID = p2p.NodeID("00112233445566778899aabbccddeeff00112233")
 	)
 
-	cs.Set(c, []net.IP{
-		{10, 0, 10, 1},
-		{10, 0, 10, 2},
-		{10, 0, 10, 3},
+	testcases := []struct {
+		endpoint p2p.Endpoint
+		expect   string
+	}{
+		// Non-networked endpoints.
+		{p2p.Endpoint{Protocol: "memory", Path: string(nodeID)}, "memory:" + string(nodeID)},
+		{p2p.Endpoint{Protocol: "file", Path: "foo"}, "file:///foo"},
+		{p2p.Endpoint{Protocol: "file", Path: "👋"}, "file:///%F0%9F%91%8B"},
+
+		// IPv4 endpoints.
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4}, "tcp://1.2.3.4"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4in6}, "tcp://1.2.3.4"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4, Port: 8080}, "tcp://1.2.3.4:8080"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4, Port: 8080, Path: "/path"}, "tcp://1.2.3.4:8080/path"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4, Path: "path/👋"}, "tcp://1.2.3.4/path/%F0%9F%91%8B"},
+
+		// IPv6 endpoints.
+		{p2p.Endpoint{Protocol: "tcp", IP: ip6}, "tcp://b10c::1"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip6, Port: 8080}, "tcp://[b10c::1]:8080"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip6, Port: 8080, Path: "/path"}, "tcp://[b10c::1]:8080/path"},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip6, Path: "path/👋"}, "tcp://b10c::1/path/%F0%9F%91%8B"},
+
+		// Partial (invalid) endpoints.
+		{p2p.Endpoint{}, ""},
+		{p2p.Endpoint{Protocol: "tcp"}, "tcp:"},
+		{p2p.Endpoint{IP: []byte{1, 2, 3, 4}}, "1.2.3.4"},
+		{p2p.Endpoint{IP: []byte{0xb1, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}}, "b10c::1"},
+		{p2p.Endpoint{Port: 8080}, ""},
+		{p2p.Endpoint{Path: "foo"}, "/foo"},
+	}
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.expect, func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.endpoint.String())
+		})
+	}
+}
+
+func TestEndpoint_Validate(t *testing.T) {
+	var (
+		ip4    = []byte{1, 2, 3, 4}
+		ip4in6 = net.IPv4(1, 2, 3, 4)
+		ip6    = []byte{0xb1, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+	)
+
+	testcases := []struct {
+		endpoint    p2p.Endpoint
+		expectValid bool
+	}{
+		// Valid endpoints.
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4}, true},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4in6}, true},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip6}, true},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4, Port: 8008}, true},
+		{p2p.Endpoint{Protocol: "tcp", IP: ip4, Port: 8080, Path: "path"}, true},
+		{p2p.Endpoint{Protocol: "memory", Path: "path"}, true},
+
+		// Invalid endpoints.
+		{p2p.Endpoint{}, false},
+		{p2p.Endpoint{IP: ip4}, false},
+		{p2p.Endpoint{Protocol: "tcp"}, false},
+		{p2p.Endpoint{Protocol: "tcp", IP: []byte{1, 2, 3}}, false},
+		{p2p.Endpoint{Protocol: "tcp", Port: 8080, Path: "path"}, false},
+	}
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.endpoint.String(), func(t *testing.T) {
+			err := tc.endpoint.Validate()
+			if tc.expectValid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+// dialAccept is a helper that dials b from a and returns both sides of the
+// connection.
+func dialAccept(t *testing.T, a, b p2p.Transport) (p2p.Connection, p2p.Connection) {
+	t.Helper()
+
+	endpoints := b.Endpoints()
+	require.NotEmpty(t, endpoints, "peer not listening on any endpoints")
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	acceptCh := make(chan p2p.Connection, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := b.Accept()
+		errCh <- err
+		acceptCh <- conn
+	}()
+
+	dialConn, err := a.Dial(ctx, endpoints[0])
+	require.NoError(t, err)
+
+	acceptConn := <-acceptCh
+	require.NoError(t, <-errCh)
+
+	t.Cleanup(func() {
+		_ = dialConn.Close()
+		_ = acceptConn.Close()
 	})
 
-	if err := filter(cs, c, []net.IP{
-		{10, 0, 10, 2},
-	}); err == nil {
-		t.Errorf("expected Peer to be rejected as duplicate")
-	}
+	return dialConn, acceptConn
 }
 
-func TestTransportHandshake(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+// dialAcceptHandshake is a helper that dials and handshakes b from a and
+// returns both sides of the connection.
+func dialAcceptHandshake(t *testing.T, a, b p2p.Transport) (p2p.Connection, p2p.Connection) {
+	t.Helper()
 
-	var (
-		peerPV       = ed25519.GenPrivKey()
-		peerNodeInfo = testNodeInfo(PubKeyToID(peerPV.PubKey()), defaultNodeName)
-	)
+	ab, ba := dialAccept(t, a, b)
 
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
 	go func() {
-		c, err := net.Dial(ln.Addr().Network(), ln.Addr().String())
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		go func(c net.Conn) {
-			_, err := protoio.NewDelimitedWriter(c).WriteMsg(peerNodeInfo.(DefaultNodeInfo).ToProto())
-			if err != nil {
-				t.Error(err)
-			}
-		}(c)
-		go func(c net.Conn) {
-			var (
-				// ni   DefaultNodeInfo
-				pbni tmp2p.DefaultNodeInfo
-			)
-
-			protoReader := protoio.NewDelimitedReader(c, MaxNodeInfoSize())
-			err := protoReader.ReadMsg(&pbni)
-			if err != nil {
-				t.Error(err)
-			}
-
-			_, err = DefaultNodeInfoFromToProto(&pbni)
-			if err != nil {
-				t.Error(err)
-			}
-		}(c)
+		privKey := ed25519.GenPrivKey()
+		nodeInfo := p2p.NodeInfo{NodeID: p2p.NodeIDFromPubKey(privKey.PubKey())}
+		_, _, err := ba.Handshake(ctx, nodeInfo, privKey)
+		errCh <- err
 	}()
 
-	c, err := ln.Accept()
-	if err != nil {
-		t.Fatal(err)
+	privKey := ed25519.GenPrivKey()
+	nodeInfo := p2p.NodeInfo{NodeID: p2p.NodeIDFromPubKey(privKey.PubKey())}
+	_, _, err := ab.Handshake(ctx, nodeInfo, privKey)
+	require.NoError(t, err)
+
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-timer.C:
+		require.Fail(t, "handshake timed out")
 	}
 
-	ni, err := handshake(c, 20*time.Millisecond, emptyNodeInfo())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if have, want := ni, peerNodeInfo; !reflect.DeepEqual(have, want) {
-		t.Errorf("have %v, want %v", have, want)
-	}
-}
-
-// create listener
-func testSetupMultiplexTransport(t *testing.T) *MultiplexTransport {
-	var (
-		pv = ed25519.GenPrivKey()
-		id = PubKeyToID(pv.PubKey())
-		mt = newMultiplexTransport(
-			testNodeInfo(
-				id, "transport",
-			),
-			NodeKey{
-				PrivKey: pv,
-			},
-		)
-	)
-
-	addr, err := NewNetAddressString(IDAddressString(id, "127.0.0.1:0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := mt.Listen(*addr); err != nil {
-		t.Fatal(err)
-	}
-
-	// give the listener some time to get ready
-	time.Sleep(20 * time.Millisecond)
-
-	return mt
-}
-
-type testTransportAddr struct{}
-
-func (a *testTransportAddr) Network() string { return "tcp" }
-func (a *testTransportAddr) String() string  { return "test.local:1234" }
-
-type testTransportConn struct{}
-
-func (c *testTransportConn) Close() error {
-	return fmt.Errorf("close() not implemented")
-}
-
-func (c *testTransportConn) LocalAddr() net.Addr {
-	return &testTransportAddr{}
-}
-
-func (c *testTransportConn) RemoteAddr() net.Addr {
-	return &testTransportAddr{}
-}
-
-func (c *testTransportConn) Read(_ []byte) (int, error) {
-	return -1, fmt.Errorf("read() not implemented")
-}
-
-func (c *testTransportConn) SetDeadline(_ time.Time) error {
-	return fmt.Errorf("setDeadline() not implemented")
-}
-
-func (c *testTransportConn) SetReadDeadline(_ time.Time) error {
-	return fmt.Errorf("setReadDeadline() not implemented")
-}
-
-func (c *testTransportConn) SetWriteDeadline(_ time.Time) error {
-	return fmt.Errorf("setWriteDeadline() not implemented")
-}
-
-func (c *testTransportConn) Write(_ []byte) (int, error) {
-	return -1, fmt.Errorf("write() not implemented")
+	return ab, ba
 }

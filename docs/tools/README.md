@@ -1,7 +1,7 @@
 ---
 order: 1
 parent:
-  title: Tools
+  title: Tooling
   order: 6
 ---
 
@@ -9,7 +9,7 @@ parent:
 
 Tendermint has some tools that are associated with it for:
 
-- [Debugging](./debugging.md)
+- [Debugging](./debugging/pro.md)
 - [Benchmarking](#benchmarking)
 - [Testnets](#testnets)
 - [Validation of remote signers](./remote-signer-validation.md)

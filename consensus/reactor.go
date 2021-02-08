@@ -142,7 +142,7 @@ func (conR *Reactor) GetChannels() []*p2p.ChannelDescriptor {
 	return []*p2p.ChannelDescriptor{
 		{
 			ID:                  StateChannel,
-			Priority:            5,
+			Priority:            6,
 			SendQueueCapacity:   100,
 			RecvMessageCapacity: maxMsgSize,
 		},
@@ -156,7 +156,7 @@ func (conR *Reactor) GetChannels() []*p2p.ChannelDescriptor {
 		},
 		{
 			ID:                  VoteChannel,
-			Priority:            5,
+			Priority:            7,
 			SendQueueCapacity:   100,
 			RecvBufferCapacity:  100 * 100,
 			RecvMessageCapacity: maxMsgSize,
@@ -220,6 +220,8 @@ func (conR *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 // Peer state updates can happen in parallel, but processing of
 // proposals, block parts, and votes are ordered by the receiveRoutine
 // NOTE: blocks on consensus state for proposals, block parts, and votes
+// XXX: do not call any methods that can block or incur heavy processing.
+// https://github.com/tendermint/tendermint/issues/2888
 func (conR *Reactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) {
 	if !conR.IsRunning() {
 		conR.Logger.Debug("Receive", "src", src, "chId", chID, "bytes", msgBytes)
@@ -228,7 +230,7 @@ func (conR *Reactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) {
 
 	msg, err := decodeMsg(msgBytes)
 	if err != nil {
-		conR.Logger.Error("Error decoding message", "src", src, "chId", chID, "msg", msg, "err", err, "bytes", msgBytes)
+		conR.Logger.Error("Error decoding message", "src", src, "chId", chID, "err", err)
 		conR.Switch.StopPeerForError(src, err)
 		return
 	}
@@ -518,7 +520,8 @@ OUTER_LOOP:
 		}
 
 		// If the peer is on a previous height that we have, help catch up.
-		if (0 < prs.Height) && (prs.Height < rs.Height) && (prs.Height >= conR.conS.blockStore.Base()) {
+		blockStoreBase := conR.conS.blockStore.Base()
+		if blockStoreBase > 0 && 0 < prs.Height && prs.Height < rs.Height && prs.Height >= blockStoreBase {
 			heightLogger := logger.With("height", prs.Height)
 
 			// if we never received the commit message from the peer, the block parts wont be initialized
@@ -526,7 +529,7 @@ OUTER_LOOP:
 				blockMeta := conR.conS.blockStore.LoadBlockMeta(prs.Height)
 				if blockMeta == nil {
 					heightLogger.Error("Failed to load block meta",
-						"blockstoreBase", conR.conS.blockStore.Base(), "blockstoreHeight", conR.conS.blockStore.Height())
+						"blockstoreBase", blockStoreBase, "blockstoreHeight", conR.conS.blockStore.Height())
 					time.Sleep(conR.conS.config.PeerGossipSleepDuration)
 				} else {
 					ps.InitProposalBlockParts(blockMeta.BlockID.PartSetHeader)
@@ -672,7 +675,8 @@ OUTER_LOOP:
 
 		// Catchup logic
 		// If peer is lagging by more than 1, send Commit.
-		if prs.Height != 0 && rs.Height >= prs.Height+2 && prs.Height >= conR.conS.blockStore.Base() {
+		blockStoreBase := conR.conS.blockStore.Base()
+		if blockStoreBase > 0 && prs.Height != 0 && rs.Height >= prs.Height+2 && prs.Height >= blockStoreBase {
 			// Load the block commit for prs.Height,
 			// which contains precommit signatures for prs.Height.
 			if commit := conR.conS.blockStore.LoadBlockCommit(prs.Height); commit != nil {

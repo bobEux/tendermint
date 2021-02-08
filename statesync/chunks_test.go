@@ -274,7 +274,7 @@ func TestChunkQueue_DiscardSender(t *testing.T) {
 	defer teardown()
 
 	// Allocate and add all chunks to the queue
-	senders := []p2p.ID{"a", "b", "c"}
+	senders := []p2p.NodeID{p2p.NodeID("a"), p2p.NodeID("b"), p2p.NodeID("c")}
 	for i := uint32(0); i < queue.Size(); i++ {
 		_, err := queue.Allocate()
 		require.NoError(t, err)
@@ -295,14 +295,14 @@ func TestChunkQueue_DiscardSender(t *testing.T) {
 	}
 
 	// Discarding an unknown sender should do nothing
-	err := queue.DiscardSender("x")
+	err := queue.DiscardSender(p2p.NodeID("x"))
 	require.NoError(t, err)
 	_, err = queue.Allocate()
 	assert.Equal(t, errDone, err)
 
 	// Discarding sender b should discard chunk 4, but not chunk 1 which has already been
 	// returned.
-	err = queue.DiscardSender("b")
+	err = queue.DiscardSender(p2p.NodeID("b"))
 	require.NoError(t, err)
 	index, err := queue.Allocate()
 	require.NoError(t, err)
@@ -315,13 +315,16 @@ func TestChunkQueue_GetSender(t *testing.T) {
 	queue, teardown := setupChunkQueue(t)
 	defer teardown()
 
-	_, err := queue.Add(&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{1}, Sender: p2p.ID("a")})
+	peerAID := p2p.NodeID("aa")
+	peerBID := p2p.NodeID("bb")
+
+	_, err := queue.Add(&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{1}, Sender: peerAID})
 	require.NoError(t, err)
-	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{2}, Sender: p2p.ID("b")})
+	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{2}, Sender: peerBID})
 	require.NoError(t, err)
 
-	assert.EqualValues(t, "a", queue.GetSender(0))
-	assert.EqualValues(t, "b", queue.GetSender(1))
+	assert.EqualValues(t, "aa", queue.GetSender(0))
+	assert.EqualValues(t, "bb", queue.GetSender(1))
 	assert.EqualValues(t, "", queue.GetSender(2))
 
 	// After the chunk has been processed, we should still know who the sender was
@@ -329,7 +332,7 @@ func TestChunkQueue_GetSender(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, chunk)
 	require.EqualValues(t, 0, chunk.Index)
-	assert.EqualValues(t, "a", queue.GetSender(0))
+	assert.EqualValues(t, "aa", queue.GetSender(0))
 }
 
 func TestChunkQueue_Next(t *testing.T) {
@@ -351,7 +354,7 @@ func TestChunkQueue_Next(t *testing.T) {
 	}()
 
 	assert.Empty(t, chNext)
-	_, err := queue.Add(&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{3, 1, 1}, Sender: p2p.ID("b")})
+	_, err := queue.Add(&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{3, 1, 1}, Sender: p2p.NodeID("b")})
 	require.NoError(t, err)
 	select {
 	case <-chNext:
@@ -359,17 +362,17 @@ func TestChunkQueue_Next(t *testing.T) {
 	default:
 	}
 
-	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{3, 1, 0}, Sender: p2p.ID("a")})
+	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{3, 1, 0}, Sender: p2p.NodeID("a")})
 	require.NoError(t, err)
 
 	assert.Equal(t,
-		&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{3, 1, 0}, Sender: p2p.ID("a")},
+		&chunk{Height: 3, Format: 1, Index: 0, Chunk: []byte{3, 1, 0}, Sender: p2p.NodeID("a")},
 		<-chNext)
 	assert.Equal(t,
-		&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{3, 1, 1}, Sender: p2p.ID("b")},
+		&chunk{Height: 3, Format: 1, Index: 1, Chunk: []byte{3, 1, 1}, Sender: p2p.NodeID("b")},
 		<-chNext)
 
-	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 4, Chunk: []byte{3, 1, 4}, Sender: p2p.ID("e")})
+	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 4, Chunk: []byte{3, 1, 4}, Sender: p2p.NodeID("e")})
 	require.NoError(t, err)
 	select {
 	case <-chNext:
@@ -377,19 +380,19 @@ func TestChunkQueue_Next(t *testing.T) {
 	default:
 	}
 
-	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 2, Chunk: []byte{3, 1, 2}, Sender: p2p.ID("c")})
+	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 2, Chunk: []byte{3, 1, 2}, Sender: p2p.NodeID("c")})
 	require.NoError(t, err)
-	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 3, Chunk: []byte{3, 1, 3}, Sender: p2p.ID("d")})
+	_, err = queue.Add(&chunk{Height: 3, Format: 1, Index: 3, Chunk: []byte{3, 1, 3}, Sender: p2p.NodeID("d")})
 	require.NoError(t, err)
 
 	assert.Equal(t,
-		&chunk{Height: 3, Format: 1, Index: 2, Chunk: []byte{3, 1, 2}, Sender: p2p.ID("c")},
+		&chunk{Height: 3, Format: 1, Index: 2, Chunk: []byte{3, 1, 2}, Sender: p2p.NodeID("c")},
 		<-chNext)
 	assert.Equal(t,
-		&chunk{Height: 3, Format: 1, Index: 3, Chunk: []byte{3, 1, 3}, Sender: p2p.ID("d")},
+		&chunk{Height: 3, Format: 1, Index: 3, Chunk: []byte{3, 1, 3}, Sender: p2p.NodeID("d")},
 		<-chNext)
 	assert.Equal(t,
-		&chunk{Height: 3, Format: 1, Index: 4, Chunk: []byte{3, 1, 4}, Sender: p2p.ID("e")},
+		&chunk{Height: 3, Format: 1, Index: 4, Chunk: []byte{3, 1, 4}, Sender: p2p.NodeID("e")},
 		<-chNext)
 
 	_, ok := <-chNext
